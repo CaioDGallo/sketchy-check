@@ -1,0 +1,89 @@
+# Sketchy (Rust port) — fraud detection backend for Rinha de Backend 2026.
+#
+# Identical topology to docker-compose.yml (Go version):
+#   haproxy 0.15 CPU + 30 MB
+#   api1    0.80 CPU + 160 MB
+#   api2    0.05 CPU + 160 MB
+#   total   1.00 CPU + 350 MB  (matches the contest cap exactly)
+#
+# Reuses haproxy/haproxy.cfg and build_resources/ unchanged.
+
+x-api-common: &api-common
+  build:
+    context: .
+    dockerfile: api-rust/Dockerfile
+    platforms:
+      - linux/amd64
+  image: sketchy-rust:local
+  volumes:
+    - rinha-sockets-rust:/sockets
+  networks:
+    - rinha-net-rust
+  ulimits:
+    nofile:
+      soft: 65535
+      hard: 65535
+
+services:
+  haproxy:
+    image: haproxy:3.3
+    container_name: sketchy-rust-haproxy
+    platform: linux/amd64
+    ports:
+      - "9999:9999"
+    volumes:
+      - ./haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+      - rinha-sockets-rust:/sockets
+    networks:
+      - rinha-net-rust
+    depends_on:
+      - api1
+      - api2
+    deploy:
+      resources:
+        limits:
+          cpus: "0.15"
+          memory: "30MB"
+
+  api1:
+    <<: *api-common
+    container_name: sketchy-rust-api1
+    hostname: api1
+    environment:
+      UDS_PATH: /sockets/api1.sock
+      INDEX_PATH: /app/index.bin
+      MCC_RISK_PATH: /app/mcc_risk.json
+      IVF_NPROBE: "1"
+      IOURING_QD: "4096"
+      ACCEPT_SQES: "256"
+      MAX_CONNS: "1024"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.80"
+          memory: "160MB"
+
+  api2:
+    <<: *api-common
+    container_name: sketchy-rust-api2
+    hostname: api2
+    environment:
+      UDS_PATH: /sockets/api2.sock
+      INDEX_PATH: /app/index.bin
+      MCC_RISK_PATH: /app/mcc_risk.json
+      IVF_NPROBE: "1"
+      IOURING_QD: "4096"
+      ACCEPT_SQES: "256"
+      MAX_CONNS: "1024"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: "160MB"
+
+networks:
+  rinha-net-rust:
+    driver: bridge
+
+volumes:
+  rinha-sockets-rust:
