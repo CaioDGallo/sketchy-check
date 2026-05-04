@@ -6,21 +6,11 @@
 #   api1    0.40 CPU + 150 MB
 #   api2    0.40 CPU + 150 MB
 #   total   1.00 CPU + 350 MB  (matches the contest cap exactly)
-
-x-api-common: &api-common
-  image: caiogallo2401/sketchy-rust:0.4.0
-  # Required for io_uring_setup to bypass Docker's default seccomp profile,
-  # which on some runtimes blocks io_uring syscalls. Matches the C #1 setup.
-  security_opt:
-    - seccomp=unconfined
-  volumes:
-    - rinha-sockets:/sockets
-  networks:
-    - rinha-net
-  ulimits:
-    nofile:
-      soft: 65535
-      hard: 65535
+#
+# security_opt is set explicitly on each api service (NOT via YAML anchor
+# merge) to guarantee it's applied even on compose tools that handle merge
+# keys conservatively. Required so io_uring_setup isn't blocked by Docker's
+# default seccomp profile.
 
 services:
   haproxy:
@@ -42,8 +32,21 @@ services:
           memory: "50MB"
 
   api1:
-    <<: *api-common
+    image: caiogallo2401/sketchy-rust:0.4.0
     hostname: api1
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - rinha-sockets:/sockets
+    networks:
+      - rinha-net
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     environment:
       UDS_PATH: /sockets/api1.sock
       INDEX_PATH: /app/index.bin
@@ -60,8 +63,21 @@ services:
           memory: "150MB"
 
   api2:
-    <<: *api-common
+    image: caiogallo2401/sketchy-rust:0.4.0
     hostname: api2
+    security_opt:
+      - seccomp=unconfined
+    volumes:
+      - rinha-sockets:/sockets
+    networks:
+      - rinha-net
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+      memlock:
+        soft: -1
+        hard: -1
     environment:
       UDS_PATH: /sockets/api2.sock
       INDEX_PATH: /app/index.bin
