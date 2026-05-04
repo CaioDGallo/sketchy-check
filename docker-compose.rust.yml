@@ -17,6 +17,11 @@ x-api-common: &api-common
     platforms:
       - linux/amd64
   image: sketchy-rust:local
+  # Required for io_uring_setup to bypass Docker's default seccomp profile,
+  # which on some runtimes blocks io_uring syscalls. The C #1 reference does
+  # the same; without this we silently fall back to the epoll loop.
+  security_opt:
+    - seccomp=unconfined
   volumes:
     - rinha-sockets-rust:/sockets
   networks:
