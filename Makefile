@@ -1,20 +1,25 @@
 SHELL := /bin/bash
-ROOT := $(abspath ..)
-RES  := $(ROOT)/resources
+
+# Path to the contest's resources/ directory (containing references.json.gz +
+# mcc_risk.json). Override via env var or `make RES=/path/to/resources index`.
+# Defaults to a sibling rinha-de-backend-2026 clone that may exist on dev boxes.
+RES ?= $(abspath ../rinha-de-backend-2026/resources)
 BUILD_RES := build_resources
 
 .PHONY: help resources index preprocess build up down logs smoke clean
 
 help:
+	@echo "Resources path (override with RES=...): $(RES)"
+	@echo
 	@echo "make targets:"
-	@echo "  index       — generate ../resources/index.bin from references.json.gz (~120s)"
-	@echo "  resources   — copy ../resources/{index.bin,mcc_risk.json} into api/build_resources/"
+	@echo "  index       — generate \$$RES/index.bin from references.json.gz (~120s)"
+	@echo "  resources   — copy \$$RES/{index.bin,mcc_risk.json} into ./build_resources/"
 	@echo "  build       — docker compose build (calls resources first)"
 	@echo "  up          — docker compose up -d --build"
 	@echo "  down        — docker compose down"
 	@echo "  logs        — docker compose logs -f"
 	@echo "  smoke       — curl smoke against http://localhost:9999"
-	@echo "  clean       — remove api/build_resources and the prebuilt index"
+	@echo "  clean       — remove ./build_resources and the prebuilt index"
 
 # Generate the IVF6 index from references.json.gz. Idempotent — overwrites
 # the existing file. ~120s on a modern Mac.

@@ -18,6 +18,7 @@ import (
 	"net"
 	"os"
 	"strconv"
+	"unsafe"
 
 	"github.com/rinha2026/sketchy/api/internal/ivf"
 	"github.com/rinha2026/sketchy/api/internal/responses"
@@ -217,8 +218,13 @@ func parseContentLength(headers []byte) (int, bool) {
 		for len(v) > 0 && (v[0] == ' ' || v[0] == '\t') {
 			v = v[1:]
 		}
-		// Parse digits.
-		n, err := strconv.Atoi(string(bytes.TrimRight(v, " \t")))
+		// Parse digits — zero-copy via unsafe.String. v is a re-slice of the
+		// per-connection request buffer, which Atoi only reads.
+		v = bytes.TrimRight(v, " \t")
+		if len(v) == 0 {
+			return 0, false
+		}
+		n, err := strconv.Atoi(unsafe.String(&v[0], len(v)))
 		if err != nil {
 			return 0, false
 		}

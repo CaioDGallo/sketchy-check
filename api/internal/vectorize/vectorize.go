@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"errors"
 	"strconv"
+	"unsafe"
 
 	"github.com/rinha2026/sketchy/api/internal/mcc"
 )
@@ -260,7 +261,10 @@ func jsonNumber(body []byte, start, end int, key []byte) (float32, bool) {
 	if q == p {
 		return 0, false
 	}
-	v, err := strconv.ParseFloat(string(body[p:q]), 32)
+	// unsafe.String avoids the string allocation that `string(body[p:q])` would
+	// trigger on every numeric field (~10 per request). The body buffer is not
+	// mutated during ParseFloat, and ParseFloat does not retain the string.
+	v, err := strconv.ParseFloat(unsafe.String(&body[p], q-p), 32)
 	if err != nil {
 		return 0, false
 	}
