@@ -24,7 +24,6 @@ pub fn run(cfg: &Config, idx: &'static Index, mcc_table: &'static mcc::Table) ->
     if mode == "epoll" {
         #[cfg(target_os = "linux")]
         {
-            eprintln!("server mode: epoll (forced via SERVER_MODE)");
             return epoll::run(cfg, idx, mcc_table);
         }
     }

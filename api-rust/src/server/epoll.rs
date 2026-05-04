@@ -1,18 +1,20 @@
-// Single-threaded epoll event loop. Used as a Linux fallback when io_uring
-// init fails (older kernels, seccomp restrictions, resource limits). Matches
-// the Go runtime's goroutine-on-epoll model with a tighter inner loop —
-// every fd is non-blocking + edge-triggered, so the kernel only wakes us
-// when there's real work.
+// Multi-threaded epoll fallback. Spawn N worker threads (configurable via
+// WORKERS env, default 3). Each worker owns its own epoll_fd + connection
+// table; all share the same listening UDS fd. The kernel distributes
+// accept(2) wakeups across the threads, so connections are spread.
 //
-// Per-connection state lives in a pre-allocated CONNS array indexed by the
-// epoll_event.u64 user data; that gives us O(1) dispatch with no per-event
-// allocation.
+// Why N threads: cgroups cap us at 0.80 CPU sec/sec, but a single thread
+// is pinned to one core's wall-clock. With 3 threads the kernel can run
+// them in parallel on up to 3 cores until the cgroup bucket is drained,
+// cutting tail latency on bursty load. Mirrors Go's GOMAXPROCS=3 + goroutine
+// scheduler model and the C reference's WORKERS=2 fork model.
 
 #![cfg(target_os = "linux")]
 
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::os::unix::net::UnixListener;
+use std::thread;
 
 use crate::config::Config;
 use crate::index::Index;
@@ -36,22 +38,60 @@ struct Conn {
     req_buf: [u8; REQ_BUF_SIZE],
 }
 
-pub fn run(cfg: &Config, idx: &Index, mcc_table: &mcc::Table) -> Result<(), String> {
+pub fn run(
+    cfg: &Config,
+    idx: &'static Index,
+    mcc_table: &'static mcc::Table,
+) -> Result<(), String> {
     let server_fd = bind_uds(&cfg.uds_path, cfg.backlog)?;
     set_nonblock(server_fd)?;
 
+    let workers = cfg.workers.max(1);
+    let nprobe = cfg.ivf_nprobe;
+    let max_conns_per_worker = (cfg.max_conns / workers).max(64);
+
+    eprintln!(
+        "server mode: epoll (workers={workers}, max_conns_per_worker={max_conns_per_worker})"
+    );
+
+    if workers == 1 {
+        return run_worker(server_fd, max_conns_per_worker, nprobe, idx, mcc_table);
+    }
+
+    let mut handles = Vec::with_capacity(workers);
+    for w in 0..workers {
+        let h = thread::Builder::new()
+            .name(format!("epoll-{w}"))
+            .spawn(move || run_worker(server_fd, max_conns_per_worker, nprobe, idx, mcc_table))
+            .map_err(|e| format!("spawn worker {w}: {e}"))?;
+        handles.push(h);
+    }
+
+    // Workers run forever. If any returns, propagate its error.
+    for h in handles {
+        match h.join() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err("worker thread panicked".to_string()),
+        }
+    }
+    Ok(())
+}
+
+fn run_worker(
+    server_fd: i32,
+    max_conns: usize,
+    nprobe: u32,
+    idx: &'static Index,
+    mcc_table: &'static mcc::Table,
+) -> Result<(), String> {
     let epfd = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
     if epfd < 0 {
         return Err(format!("epoll_create1: {}", last_os_error()));
     }
-    eprintln!(
-        "server mode: epoll (single-threaded, max_conns={})",
-        cfg.max_conns
-    );
-
     epoll_add(epfd, server_fd, LISTENER_TAG, libc::EPOLLIN as u32)?;
 
-    let mut conns = alloc_conns(cfg.max_conns);
+    let mut conns = alloc_conns(max_conns);
     let n_conns = conns.len();
     let mut events: Vec<libc::epoll_event> = vec![
         libc::epoll_event { events: 0, u64: 0 };
@@ -90,12 +130,11 @@ pub fn run(cfg: &Config, idx: &Index, mcc_table: &mcc::Table) -> Result<(), Stri
             }
 
             if !should_close && (mask & libc::EPOLLIN as u32 != 0) {
-                if read_loop(cidx, &mut conns, idx, mcc_table, cfg.ivf_nprobe, &mut q) {
+                if read_loop(cidx, &mut conns, idx, mcc_table, nprobe, &mut q) {
                     should_close = true;
                 }
             }
 
-            // EPOLLOUT (or in-line write attempt after read parses a request)
             if !should_close && conns[cidx].res_len > conns[cidx].res_sent {
                 if write_loop(cidx, &mut conns, epfd) {
                     should_close = true;
@@ -129,7 +168,6 @@ fn read_loop(
     loop {
         let c = &mut conns[cidx];
         if c.req_len >= REQ_BUF_SIZE - 1 {
-            // Buffer full: try one process pass with is_full=true.
             let bytes = &c.req_buf[..c.req_len];
             if let Some(Done { response, close }) =
                 http::process(bytes, true, q, idx, mcc_table, nprobe)
@@ -164,7 +202,6 @@ fn read_loop(
         }
         c.req_len += n as usize;
 
-        // Try to satisfy a complete request from accumulated bytes.
         let bytes = &c.req_buf[..c.req_len];
         let is_full = c.req_len >= REQ_BUF_SIZE - 1;
         match http::process(bytes, is_full, q, idx, mcc_table, nprobe) {
@@ -185,7 +222,6 @@ fn write_loop(cidx: usize, conns: &mut [Conn], epfd: i32) -> bool {
     loop {
         let c = &mut conns[cidx];
         if c.res_sent >= c.res_len {
-            // Done with this response. Reset for next request (keep-alive).
             if c.close_after_write {
                 return true;
             }
@@ -193,7 +229,6 @@ fn write_loop(cidx: usize, conns: &mut [Conn], epfd: i32) -> bool {
             c.res_ptr = std::ptr::null();
             c.res_len = 0;
             c.res_sent = 0;
-            // Disarm EPOLLOUT.
             if c.epoll_writable {
                 let _ = epoll_mod(epfd, c.fd, cidx as u64, libc::EPOLLIN as u32);
                 c.epoll_writable = false;
@@ -211,7 +246,6 @@ fn write_loop(cidx: usize, conns: &mut [Conn], epfd: i32) -> bool {
             let err = std::io::Error::last_os_error();
             match err.kind() {
                 std::io::ErrorKind::WouldBlock => {
-                    // Arm EPOLLOUT and wait for kernel to wake us.
                     if !c.epoll_writable {
                         let _ = epoll_mod(
                             epfd,
@@ -251,7 +285,7 @@ fn accept_loop(server_fd: i32, epfd: i32, conns: &mut [Conn]) -> Result<(), Stri
         }
         match alloc_conn(conns, fd) {
             Some(idx) => {
-                if let Err(_) = epoll_add(epfd, fd, idx as u64, libc::EPOLLIN as u32) {
+                if epoll_add(epfd, fd, idx as u64, libc::EPOLLIN as u32).is_err() {
                     free_conn(epfd, &mut conns[idx]);
                 }
             }
@@ -263,10 +297,7 @@ fn accept_loop(server_fd: i32, epfd: i32, conns: &mut [Conn]) -> Result<(), Stri
 }
 
 fn epoll_add(epfd: i32, fd: i32, tag: u64, events: u32) -> Result<(), String> {
-    let mut ev = libc::epoll_event {
-        events,
-        u64: tag,
-    };
+    let mut ev = libc::epoll_event { events, u64: tag };
     let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_ADD, fd, &mut ev) };
     if rc < 0 {
         return Err(format!("epoll_ctl ADD: {}", last_os_error()));
@@ -275,10 +306,7 @@ fn epoll_add(epfd: i32, fd: i32, tag: u64, events: u32) -> Result<(), String> {
 }
 
 fn epoll_mod(epfd: i32, fd: i32, tag: u64, events: u32) -> Result<(), String> {
-    let mut ev = libc::epoll_event {
-        events,
-        u64: tag,
-    };
+    let mut ev = libc::epoll_event { events, u64: tag };
     let rc = unsafe { libc::epoll_ctl(epfd, libc::EPOLL_CTL_MOD, fd, &mut ev) };
     if rc < 0 {
         return Err(format!("epoll_ctl MOD: {}", last_os_error()));
@@ -297,15 +325,13 @@ fn bind_uds(path: &str, backlog: i32) -> Result<i32, String> {
     let listener = UnixListener::bind(path).map_err(|e| format!("bind {path}: {e}"))?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o666))
         .map_err(|e| format!("chmod {path}: {e}"))?;
-    let fd = listener.as_raw_fd();
-    let _keep = listener;
-    let owned = _keep.into_raw_fd();
+    let _ = listener.as_raw_fd();
+    let owned = listener.into_raw_fd();
     if backlog > 0 {
         unsafe {
             libc::listen(owned, backlog);
         }
     }
-    let _ = fd;
     Ok(owned)
 }
 

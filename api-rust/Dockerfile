@@ -38,6 +38,7 @@ ENV INDEX_PATH=/app/index.bin \
     IOURING_QD=4096 \
     ACCEPT_SQES=256 \
     BACKLOG=4096 \
-    MAX_CONNS=1024
+    MAX_CONNS=1024 \
+    WORKERS=2
 
 ENTRYPOINT ["/app/api"]

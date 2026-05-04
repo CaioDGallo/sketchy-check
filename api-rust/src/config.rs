@@ -9,6 +9,7 @@ pub struct Config {
     pub accept_sqes: u32,
     pub backlog: i32,
     pub max_conns: usize,
+    pub workers: usize,
 }
 
 impl Config {
@@ -22,6 +23,7 @@ impl Config {
         let accept_sqes = parse_u32("ACCEPT_SQES", 256)?;
         let backlog = parse_u32("BACKLOG", 4096)? as i32;
         let max_conns = parse_u32("MAX_CONNS", 1024)? as usize;
+        let workers = parse_u32("WORKERS", 2)? as usize;
         Ok(Self {
             uds_path,
             index_path,
@@ -31,6 +33,7 @@ impl Config {
             accept_sqes,
             backlog,
             max_conns,
+            workers: workers.max(1),
         })
     }
 }

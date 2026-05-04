@@ -1,9 +1,11 @@
 # Sketchy (Rust port) — fraud detection backend for Rinha de Backend 2026.
 #
-# Identical topology to docker-compose.yml (Go version):
-#   haproxy 0.15 CPU + 30 MB
-#   api1    0.80 CPU + 160 MB
-#   api2    0.05 CPU + 160 MB
+# Symmetric topology — both APIs serve traffic in parallel (no backup).
+# Matches the C #1 reference's compose: parallelism via two single-CPU
+# processes lets each Rust worker run io_uring/epoll on its own core.
+#   haproxy 0.20 CPU + 50 MB
+#   api1    0.40 CPU + 150 MB
+#   api2    0.40 CPU + 150 MB
 #   total   1.00 CPU + 350 MB  (matches the contest cap exactly)
 #
 # Reuses haproxy/haproxy.cfg and build_resources/ unchanged.
@@ -42,8 +44,8 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.15"
-          memory: "30MB"
+          cpus: "0.20"
+          memory: "50MB"
 
   api1:
     <<: *api-common
@@ -57,11 +59,12 @@ services:
       IOURING_QD: "4096"
       ACCEPT_SQES: "256"
       MAX_CONNS: "1024"
+      WORKERS: "2"
     deploy:
       resources:
         limits:
-          cpus: "0.80"
-          memory: "160MB"
+          cpus: "0.40"
+          memory: "150MB"
 
   api2:
     <<: *api-common
@@ -75,11 +78,12 @@ services:
       IOURING_QD: "4096"
       ACCEPT_SQES: "256"
       MAX_CONNS: "1024"
+      WORKERS: "2"
     deploy:
       resources:
         limits:
-          cpus: "0.05"
-          memory: "160MB"
+          cpus: "0.40"
+          memory: "150MB"
 
 networks:
   rinha-net-rust:
