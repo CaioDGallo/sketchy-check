@@ -55,9 +55,33 @@ pub unsafe fn scan_range_avx2(
     let mut tmp_lo = [0u64; 4];
     let mut tmp_hi = [0u64; 4];
 
+    // Prefetch distance, in i16 elements ahead of the current load.
+    // 32 i16 = 1 cache line (64 B). We step by 8 per iter, so every fourth
+    // iteration crosses into a fresh line — issuing one PREFETCHT0 per dim
+    // per iter over-prefetches but keeps the L1 fill ahead of demand for
+    // every dim stream (Haswell's HW prefetcher only tracks ~8 streams; we
+    // have 14, so software prefetch covers the gap).
+    const PREFETCH_AHEAD: usize = 32;
+
     let mut i = start;
     let limit = end - ((end - start) & 7);
     while i < limit {
+        let pi = i + PREFETCH_AHEAD;
+        _mm_prefetch(d5.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d6.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d2.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d0.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d7.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d8.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d11.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d12.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d9.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d10.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d1.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d13.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d3.add(pi) as *const i8, _MM_HINT_T0);
+        _mm_prefetch(d4.add(pi) as *const i8, _MM_HINT_T0);
+
         let mut lo = _mm256_setzero_si256();
         let mut hi = _mm256_setzero_si256();
         // Selectivity-friendly order matching scalar: 5,6,2,0,7,8,11,12,9,10,1,13,3,4.

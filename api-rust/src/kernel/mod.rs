@@ -104,35 +104,39 @@ fn search_into(idx: &Index, q_float: &[f32; D], nprobe: u32, t: &mut Top5) -> Se
 
 #[inline]
 fn scan_range(idx: &Index, start: i32, end: i32, q: &[i16; D], t: &mut Top5) {
-    #[cfg(target_arch = "x86_64")]
+    // The production Dockerfile pins -C target-cpu=haswell and -C target-feature=+avx2,
+    // so on x86_64 builds AVX2 is statically guaranteed and the runtime detect is dead.
+    // Gating with cfg(target_feature) lets LLVM eliminate the branch and inline the
+    // AVX2 routine directly into the dispatcher.
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
     {
-        if std::is_x86_feature_detected!("avx2") {
-            // SAFETY: AVX2 detected at runtime; function is gated to AVX2 ISA.
-            unsafe {
-                avx2::scan_range_avx2(
-                    &idx.dims_buf,
-                    idx.n,
-                    start as usize,
-                    end as usize,
-                    q,
-                    &idx.labels,
-                    &idx.orig_ids,
-                    t,
-                );
-            }
-            return;
+        // SAFETY: target_feature = "avx2" is enabled at compile time.
+        unsafe {
+            avx2::scan_range_avx2(
+                &idx.dims_buf,
+                idx.n,
+                start as usize,
+                end as usize,
+                q,
+                &idx.labels,
+                &idx.orig_ids,
+                t,
+            );
         }
     }
-    scalar::scan_range_scalar(
-        &idx.dims_buf,
-        idx.n,
-        start as usize,
-        end as usize,
-        q,
-        &idx.labels,
-        &idx.orig_ids,
-        t,
-    );
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        scalar::scan_range_scalar(
+            &idx.dims_buf,
+            idx.n,
+            start as usize,
+            end as usize,
+            q,
+            &idx.labels,
+            &idx.orig_ids,
+            t,
+        );
+    }
 }
 
 #[inline]
@@ -206,4 +210,92 @@ fn bbox_lower_bound(q: &[i16; D], bbox_min: &[i16], bbox_max: &[i16], c: usize) 
         s += (d as i64 * d as i64) as u64;
     }
     s
+}
+
+#[cfg(all(test, target_arch = "x86_64", target_feature = "avx2"))]
+mod parity_tests {
+    use super::scalar::scan_range_scalar;
+    use super::avx2::scan_range_avx2;
+    use super::top5::Top5;
+
+    // Build a deterministic synthetic dataset and confirm AVX2 and scalar
+    // produce bit-identical Top5 state (best_d, best_l, best_id, worst_*).
+    // The contest demands byte-identical output, so this catches any future
+    // optimization that drifts the AVX2 path off the scalar oracle.
+    fn synth(n: usize, seed: u32) -> (Vec<i16>, Vec<u8>, Vec<u32>) {
+        let mut dims = vec![0i16; 14 * n];
+        let mut labels = vec![0u8; n];
+        let mut ids = vec![0u32; n];
+        let mut s = seed;
+        let mut rng = || {
+            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+            s
+        };
+        for j in 0..14 {
+            for i in 0..n {
+                let v = (rng() as i32 & 0x3FFF) - 0x2000;
+                dims[j * n + i] = v as i16;
+            }
+        }
+        for i in 0..n {
+            labels[i] = (rng() & 1) as u8;
+            ids[i] = rng();
+        }
+        (dims, labels, ids)
+    }
+
+    #[test]
+    fn avx2_matches_scalar_full_range() {
+        let n = 200;
+        let (dims, labels, ids) = synth(n, 0xC0FFEE);
+        let q: [i16; 14] = [100, -50, 200, 0, -1000, 500, 250, -333, 42, 7, -77, 999, -1, 0];
+
+        let mut t_av = Top5::new();
+        let mut t_sc = Top5::new();
+        unsafe {
+            scan_range_avx2(&dims, n, 0, n, &q, &labels, &ids, &mut t_av);
+        }
+        scan_range_scalar(&dims, n, 0, n, &q, &labels, &ids, &mut t_sc);
+        assert_eq!(t_av.best_d, t_sc.best_d, "best_d mismatch");
+        assert_eq!(t_av.best_id, t_sc.best_id, "best_id mismatch");
+        assert_eq!(t_av.best_l, t_sc.best_l, "best_l mismatch");
+        assert_eq!(t_av.worst_d, t_sc.worst_d, "worst_d mismatch");
+        assert_eq!(t_av.worst_id, t_sc.worst_id, "worst_id mismatch");
+    }
+
+    #[test]
+    fn avx2_matches_scalar_unaligned_tail() {
+        // n not a multiple of 8 — exercises the scalar tail call inside AVX2.
+        let n = 67;
+        let (dims, labels, ids) = synth(n, 0xBEEF);
+        let q: [i16; 14] = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let mut t_av = Top5::new();
+        let mut t_sc = Top5::new();
+        unsafe {
+            scan_range_avx2(&dims, n, 0, n, &q, &labels, &ids, &mut t_av);
+        }
+        scan_range_scalar(&dims, n, 0, n, &q, &labels, &ids, &mut t_sc);
+        assert_eq!(t_av.best_d, t_sc.best_d);
+        assert_eq!(t_av.best_id, t_sc.best_id);
+        assert_eq!(t_av.best_l, t_sc.best_l);
+    }
+
+    #[test]
+    fn avx2_matches_scalar_partial_range() {
+        // start > 0 — exercises the start-offset path inside the AVX2 loop.
+        let n = 256;
+        let (dims, labels, ids) = synth(n, 0xDEAD);
+        let q: [i16; 14] = [-500, 500, 0, 0, 1000, -1000, 0, 0, 0, 0, 0, 0, 0, 0];
+
+        let mut t_av = Top5::new();
+        let mut t_sc = Top5::new();
+        unsafe {
+            scan_range_avx2(&dims, n, 13, 137, &q, &labels, &ids, &mut t_av);
+        }
+        scan_range_scalar(&dims, n, 13, 137, &q, &labels, &ids, &mut t_sc);
+        assert_eq!(t_av.best_d, t_sc.best_d);
+        assert_eq!(t_av.best_id, t_sc.best_id);
+        assert_eq!(t_av.best_l, t_sc.best_l);
+    }
 }

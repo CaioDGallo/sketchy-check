@@ -5,6 +5,14 @@ is functionally complete and serves the contest workload with **detection_score
 = 3000 (perfect, 0 errors)**. Final-score plateau is at **~5255 / 6000**, with
 p99 ≈ 5.56 ms. This plan covers the two paths to break the plateau.
 
+> **Status update (this iteration, pre-grader):** C.5 (drop runtime AVX2
+> dispatch) and C.2 (prefetch ahead in hot loop) are implemented on
+> branch `posthog-code/rust-port`. Local linux/amd64 (qemu) smoke passes
+> with byte-identical responses to v0.5.1; AVX2-vs-scalar parity tests
+> added in `kernel/mod.rs::parity_tests`. **Next: ship v0.6.0 image,
+> grader run, and decide between C.1 (PGO) and C.3 (bbox cluster
+> pruning) based on the delta.**
+
 ---
 
 ## Current state
@@ -27,6 +35,7 @@ p99 ≈ 5.56 ms. This plan covers the two paths to break the plateau.
 | v0.4.0 | + memchr SIMD memmem in JSON parser | 5246 | 5.68 ms |
 | v0.5.0 | + seccomp=unconfined (anchor-merged) | 5248 | 5.65 ms |
 | v0.5.1 | + explicit per-service security_opt + memlock=-1 | 5255 | 5.56 ms |
+| v0.6.0 | + AVX2 dispatch cfg-gated + prefetch in hot loop | TBD | TBD |
 
 ### Latest grader result (commit `f2fa793`, image v0.4.0)
 
@@ -243,28 +252,22 @@ Expected gain: **5–15% on hot-loop performance.** If our hot loop is mostly
 the AVX2 dispatch + Top5 update path, PGO should give better register
 allocation and inlining.
 
-### C.2 — AVX2 prefetch ahead
+### C.2 — AVX2 prefetch ahead — **DONE in v0.6.0**
 
-Hot path: `api-rust/src/kernel/avx2.rs:48–86`. Each iteration loads 14
+Hot path: `api-rust/src/kernel/avx2.rs`. Each iteration loads 14
 streams at offset `i`, processes 8 vectors at a time. The L1d footprint
 is ~32 KB; 14 streams × 64 bytes = 896 bytes per iter — well in L1, but
-we may be missing on prefetch ahead.
+Haswell's HW prefetcher only tracks ~8 forward streams, leaving 4–6 of
+our dim streams paying L2/L3 latency on cluster boundaries.
 
-Add explicit prefetch hints:
+Implemented as 14 `_mm_prefetch(..., _MM_HINT_T0)` calls per loop iter,
+one per dim, at offset `i + 32` (one cache line ahead). Over-prefetches
+~4× since we only cross a line every 4 iters, but PREFETCHT0 is a single
+cheap uop and over-prefetch into resident lines is a no-op.
 
-```rust
-use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-// Inside the AVX2 loop, before the acc_dim cluster:
-_mm_prefetch(d5.add(i + 64) as *const i8, _MM_HINT_T0);
-_mm_prefetch(d6.add(i + 64) as *const i8, _MM_HINT_T0);
-// ... for each of the 14 dims, prefetch i+64
-```
-
-Or batch by issuing 14 prefetches once per iteration. Tune the offset (try
-32, 64, 128 cache lines ahead).
-
-Expected gain: **5–20% on the search loop**, depending on whether the
-hardware prefetcher already covers the access pattern.
+Tunable: try `PREFETCH_AHEAD = 64` (2 lines, ~8 iters cushion) on the
+grader if 32 underperforms; that covers L3 latency where 32 only covers
+L2.
 
 ### C.3 — Reduce bbox-repair scans
 
@@ -295,13 +298,29 @@ Also: in the AVX2 commit phase
 results first, then committing in one pass with a single worst-update at
 the end. Subtle, but reduces dependent loads in the hot loop.
 
-### C.5 — Inline the AVX2 dispatch
+### C.5 — Inline the AVX2 dispatch — **DONE in v0.6.0**
 
-`api-rust/src/kernel/mod.rs:78–101`. Currently `scan_range` does a runtime
-`is_x86_feature_detected!("avx2")` check on every call. Cached after first
-call but still a memory load per cluster. With `-C target-cpu=haswell` the
-binary always has AVX2; we can drop the runtime check entirely behind a
-`cfg!(target_feature = "avx2")`.
+Was: runtime `is_x86_feature_detected!("avx2")` check on every
+`scan_range` call (atomic load per cluster, ~50 clusters per query × 900
+RPS = 45k loads/sec).
+
+Now: `#[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]` —
+the production Dockerfile pins `-C target-feature=+avx2`, so the cfg is
+const-true at build time. LLVM eliminates the branch and can inline
+`scan_range_avx2` directly into `search_into`. Scalar fallback is gated
+to the negation, so arm64 dev builds keep working.
+
+A regression net was added in `kernel/mod.rs::parity_tests` (gated to
+x86_64+avx2): three tests that build a synthetic dataset and assert
+AVX2 and scalar produce bit-identical Top5 state on full-range,
+unaligned-tail, and start-offset cases. Run with:
+
+```bash
+RUSTFLAGS="-C target-cpu=haswell -C target-feature=+avx2,+fma" \
+  cargo test --release --target x86_64-unknown-linux-gnu
+```
+
+(Requires an x86_64 runner — not executable on macOS arm64.)
 
 ---
 
