@@ -39,6 +39,6 @@ ENV INDEX_PATH=/app/index.bin \
     IVF_NPROBE=1 \
     GOGC=off \
     GOMEMLIMIT=140MiB \
-    GOMAXPROCS=1
+    GOMAXPROCS=2
 
 ENTRYPOINT ["/app/api"]

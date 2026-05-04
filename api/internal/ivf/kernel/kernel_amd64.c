@@ -18,9 +18,16 @@
 
 #include "kernel_amd64.h"
 
+#include <float.h>
+#include <string.h>
+
 #ifdef __AVX2__
 #include <immintrin.h>
 #endif
+
+#define SKETCHY_DIM 14
+#define SKETCHY_IVF_CLUSTERS 256
+#define SKETCHY_FIX_SCALE 10000.0f
 
 static inline int is_better_pair(uint64_t da, uint32_t ia, uint64_t db, uint32_t ib) {
     return da < db || (da == db && ia < ib);
@@ -54,6 +61,70 @@ static inline void try_insert(uint64_t d, uint8_t label, uint32_t orig_id, sketc
 static inline uint64_t sqdiff_i16(int16_t a, int16_t b) {
     int32_t d = (int32_t)a - (int32_t)b;
     return (uint64_t)((int64_t)d * (int64_t)d);
+}
+
+static inline int16_t quantize_fixed(float x) {
+    if (x < -1.0f) x = -1.0f;
+    if (x > 1.0f) x = 1.0f;
+
+    float scaled = x * SKETCHY_FIX_SCALE;
+    scaled += scaled >= 0.0f ? 0.5f : -0.5f;
+
+    if (scaled < -SKETCHY_FIX_SCALE) scaled = -SKETCHY_FIX_SCALE;
+    if (scaled > SKETCHY_FIX_SCALE) scaled = SKETCHY_FIX_SCALE;
+
+    return (int16_t)scaled;
+}
+
+static inline void top5_reset(sketchy_top5_t *t) {
+    for (int i = 0; i < 5; i++) {
+        t->best_d[i] = UINT64_MAX;
+        t->best_id[i] = UINT32_MAX;
+        t->best_l[i] = 0;
+    }
+    t->worst = 0;
+    t->worst_d = UINT64_MAX;
+    t->worst_id = UINT32_MAX;
+}
+
+static inline int top5_frauds(const sketchy_top5_t *t) {
+    return (t->best_l[0] == 1) + (t->best_l[1] == 1) + (t->best_l[2] == 1) +
+           (t->best_l[3] == 1) + (t->best_l[4] == 1);
+}
+
+static inline float centroid_sqdist(const float q[SKETCHY_DIM], const float *centroids, int c) {
+    const float *cent = centroids + (size_t)c * SKETCHY_DIM;
+    float s = 0.0f;
+    for (int j = 0; j < SKETCHY_DIM; j++) {
+        float d = q[j] - cent[j];
+        s += d * d;
+    }
+    return s;
+}
+
+static inline void insert_probe_cluster(int cluster, float penalty, int *best_c, float *best_p, int nprobe) {
+    if (penalty >= best_p[nprobe - 1]) return;
+    int pos = nprobe - 1;
+    while (pos > 0 && penalty < best_p[pos - 1]) pos--;
+    for (int i = nprobe - 1; i > pos; i--) {
+        best_p[i] = best_p[i - 1];
+        best_c[i] = best_c[i - 1];
+    }
+    best_p[pos] = penalty;
+    best_c[pos] = cluster;
+}
+
+static inline uint64_t bbox_lower_bound(const int16_t q[SKETCHY_DIM], const int16_t *bbox_min, const int16_t *bbox_max, int c) {
+    const int16_t *mn = bbox_min + (size_t)c * SKETCHY_DIM;
+    const int16_t *mx = bbox_max + (size_t)c * SKETCHY_DIM;
+    uint64_t s = 0;
+    for (int j = 0; j < SKETCHY_DIM; j++) {
+        int32_t d = 0;
+        if (q[j] < mn[j]) d = (int32_t)mn[j] - (int32_t)q[j];
+        else if (q[j] > mx[j]) d = (int32_t)q[j] - (int32_t)mx[j];
+        s += (uint64_t)((int64_t)d * (int64_t)d);
+    }
+    return s;
 }
 
 static void scan_range_scalar(
@@ -229,4 +300,75 @@ void sketchy_scan_range(
 #else
     scan_range_scalar(dims_buf, n_per_dim, start, end, q, labels, ids, t);
 #endif
+}
+
+int sketchy_search_frauds(
+    const int16_t *dims_buf,
+    int n_per_dim,
+    const float *centroids,
+    const int16_t *bbox_min,
+    const int16_t *bbox_max,
+    const uint32_t *offsets,
+    const float q_float[14],
+    int nprobe,
+    const uint8_t *labels,
+    const uint32_t *ids,
+    uint32_t *scanned_clusters,
+    uint32_t *scanned_vectors)
+{
+    if (nprobe < 1) nprobe = 1;
+    if (nprobe > SKETCHY_IVF_CLUSTERS) nprobe = SKETCHY_IVF_CLUSTERS;
+
+    int16_t q[SKETCHY_DIM];
+    float q_grid[SKETCHY_DIM];
+    for (int j = 0; j < SKETCHY_DIM; j++) {
+        q[j] = quantize_fixed(q_float[j]);
+        q_grid[j] = (float)q[j] / SKETCHY_FIX_SCALE;
+    }
+
+    int best_c[SKETCHY_IVF_CLUSTERS];
+    float best_p[SKETCHY_IVF_CLUSTERS];
+    for (int i = 0; i < nprobe; i++) {
+        best_c[i] = -1;
+        best_p[i] = FLT_MAX;
+    }
+    for (int c = 0; c < SKETCHY_IVF_CLUSTERS; c++) {
+        insert_probe_cluster(c, centroid_sqdist(q_grid, centroids, c), best_c, best_p, nprobe);
+    }
+
+    sketchy_top5_t top;
+    top5_reset(&top);
+
+    uint8_t scanned_cluster[SKETCHY_IVF_CLUSTERS];
+    memset(scanned_cluster, 0, sizeof(scanned_cluster));
+    uint32_t clusters = 0;
+    uint32_t vectors = 0;
+
+    for (int pi = 0; pi < nprobe; pi++) {
+        int c = best_c[pi];
+        if (c < 0) continue;
+        int start = (int)offsets[c];
+        int end = (int)offsets[c + 1];
+        if (end <= start) continue;
+        scanned_cluster[c] = 1;
+        sketchy_scan_range(dims_buf, n_per_dim, start, end, q, labels, ids, &top);
+        clusters++;
+        vectors += (uint32_t)(end - start);
+    }
+
+    for (int c = 0; c < SKETCHY_IVF_CLUSTERS; c++) {
+        if (scanned_cluster[c]) continue;
+        int start = (int)offsets[c];
+        int end = (int)offsets[c + 1];
+        if (end <= start) continue;
+        if (bbox_lower_bound(q, bbox_min, bbox_max, c) <= top.worst_d) {
+            sketchy_scan_range(dims_buf, n_per_dim, start, end, q, labels, ids, &top);
+            clusters++;
+            vectors += (uint32_t)(end - start);
+        }
+    }
+
+    if (scanned_clusters) *scanned_clusters = clusters;
+    if (scanned_vectors) *scanned_vectors = vectors;
+    return top5_frauds(&top);
 }

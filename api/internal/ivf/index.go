@@ -14,9 +14,9 @@ import (
 )
 
 const (
-	D        = 14         // vector dimension
-	K        = 256        // IVF cluster count
-	FixScale = 10000.0    // quantization scale: float [-1,1] → int16 [-10000,10000]
+	D        = 14      // vector dimension
+	K        = 256     // IVF cluster count
+	FixScale = 10000.0 // quantization scale: float [-1,1] → int16 [-10000,10000]
 	magic    = "IVF6"
 )
 
@@ -49,6 +49,7 @@ type Index struct {
 	BBoxMax []int16
 
 	// ClusterStart/End[c] are inclusive/exclusive offsets into Dim[j], Labels, OrigIDs.
+	Offsets      [K + 1]uint32
 	ClusterStart [K]int
 	ClusterEnd   [K]int
 }
@@ -114,9 +115,11 @@ func Load(path string) (*Index, error) {
 		return nil, fmt.Errorf("read offsets: %w", err)
 	}
 	for c := 0; c < K; c++ {
+		idx.Offsets[c] = offsets[c]
 		idx.ClusterStart[c] = int(offsets[c])
 		idx.ClusterEnd[c] = int(offsets[c+1])
 	}
+	idx.Offsets[K] = offsets[K]
 
 	idx.DimsBuf = make([]int16, D*idx.N)
 	for j := 0; j < D; j++ {

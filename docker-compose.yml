@@ -59,7 +59,7 @@ services:
       IVF_NPROBE: "1"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
-      GOMAXPROCS: "1"
+      GOMAXPROCS: "2"
 
   api2:
     <<: *api-common
@@ -72,7 +72,7 @@ services:
       IVF_NPROBE: "1"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
-      GOMAXPROCS: "1"
+      GOMAXPROCS: "2"
 
 networks:
   rinha-net:

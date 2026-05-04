@@ -14,6 +14,23 @@ func TestSearchNProbe1DoesNotAllocate(t *testing.T) {
 	}
 }
 
+func TestSearchMatchesBruteForce(t *testing.T) {
+	idx := newBenchmarkIndex(17)
+	queries := [][D]float32{
+		benchmarkQuery(),
+		{0.10, 0.20, 0.30, 0.40, 0.50, -1, -1, 0.60, 0.70, 1, 0, 1, 0.5, 0.80},
+		{1, 1, 1, 1, 1, 0.2, 0.3, 1, 1, 0, 1, 0, 0.85, 1},
+	}
+
+	for _, q := range queries {
+		got := idx.Search(&q, SearchOpts{NProbe: 1})
+		want := bruteForceFrauds(idx, &q)
+		if got != want {
+			t.Fatalf("Search()=%d, brute=%d for q=%v", got, want, q)
+		}
+	}
+}
+
 func BenchmarkSearch_NProbe1(b *testing.B) {
 	idx := newBenchmarkIndex(64)
 	q := benchmarkQuery()
@@ -42,6 +59,7 @@ func newBenchmarkIndex(perCluster int) *Index {
 		start := c * perCluster
 		end := start + perCluster
 		center := benchmarkCenter(c)
+		idx.Offsets[c] = uint32(start)
 		idx.ClusterStart[c] = start
 		idx.ClusterEnd[c] = end
 
@@ -59,6 +77,7 @@ func newBenchmarkIndex(perCluster int) *Index {
 			}
 		}
 	}
+	idx.Offsets[K] = uint32(n)
 
 	return idx
 }
@@ -79,4 +98,71 @@ func clampI16(v int32) int16 {
 		return 10000
 	}
 	return int16(v)
+}
+
+func bruteForceFrauds(idx *Index, q *[D]float32) int {
+	var qInt [D]int16
+	for j := 0; j < D; j++ {
+		qInt[j] = testQuantize(q[j])
+	}
+	bestD := [5]uint64{^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0), ^uint64(0)}
+	bestID := [5]uint32{^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0), ^uint32(0)}
+	var bestL [5]uint8
+	worst := 0
+	worstD := bestD[0]
+	worstID := bestID[0]
+
+	for i := 0; i < idx.N; i++ {
+		var dist uint64
+		for j := 0; j < D; j++ {
+			d := int32(qInt[j]) - int32(idx.Dim[j][i])
+			dist += uint64(int64(d) * int64(d))
+		}
+		oid := idx.OrigIDs[i]
+		if dist < worstD || (dist == worstD && oid < worstID) {
+			bestD[worst] = dist
+			bestID[worst] = oid
+			bestL[worst] = idx.Labels[i]
+			worst = bruteWorst(bestD, bestID)
+			worstD = bestD[worst]
+			worstID = bestID[worst]
+		}
+	}
+	frauds := 0
+	for _, label := range bestL {
+		if label == 1 {
+			frauds++
+		}
+	}
+	return frauds
+}
+
+func bruteWorst(d [5]uint64, id [5]uint32) int {
+	w := 0
+	for i := 1; i < 5; i++ {
+		if d[i] > d[w] || (d[i] == d[w] && id[i] > id[w]) {
+			w = i
+		}
+	}
+	return w
+}
+
+func testQuantize(x float32) int16 {
+	if x < -1 {
+		x = -1
+	} else if x > 1 {
+		x = 1
+	}
+	scaled := x * FixScale
+	if scaled >= 0 {
+		scaled += 0.5
+	} else {
+		scaled -= 0.5
+	}
+	if scaled < -FixScale {
+		scaled = -FixScale
+	} else if scaled > FixScale {
+		scaled = FixScale
+	}
+	return int16(scaled)
 }

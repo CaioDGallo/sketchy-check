@@ -24,6 +24,7 @@ func main() {
 	mccPath := envDefault("MCC_RISK_PATH", "/app/mcc_risk.json")
 	udsPath := envDefault("UDS_PATH", "/sockets/api.sock")
 	nprobe := envInt("IVF_NPROBE", 1)
+	profileEvery := envInt("SKETCHY_PROFILE_EVERY", 0)
 
 	responses.Init()
 
@@ -39,9 +40,10 @@ func main() {
 	log.Printf("index IVF6 loaded: N=%d K=%d in %s", idx.N, ivf.K, time.Since(t0))
 
 	ln, err := server.Run(server.Config{
-		UDSPath:    udsPath,
-		Index:      idx,
-		SearchOpts: ivf.SearchOpts{NProbe: nprobe},
+		UDSPath:      udsPath,
+		Index:        idx,
+		SearchOpts:   ivf.SearchOpts{NProbe: nprobe},
+		ProfileEvery: profileEvery,
 	})
 	if err != nil {
 		log.Fatalf("server: %v", err)

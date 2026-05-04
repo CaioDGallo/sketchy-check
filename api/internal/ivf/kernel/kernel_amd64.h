@@ -44,4 +44,18 @@ void sketchy_scan_range(
     const uint32_t *ids,
     sketchy_top5_t *top5);
 
+int sketchy_search_frauds(
+    const int16_t *dims_buf,
+    int n_per_dim,
+    const float *centroids,
+    const int16_t *bbox_min,
+    const int16_t *bbox_max,
+    const uint32_t *offsets,
+    const float q_float[14],
+    int nprobe,
+    const uint8_t *labels,
+    const uint32_t *ids,
+    uint32_t *scanned_clusters,
+    uint32_t *scanned_vectors);
+
 #endif

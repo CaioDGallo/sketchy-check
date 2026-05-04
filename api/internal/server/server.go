@@ -15,9 +15,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"os"
 	"strconv"
+	"sync/atomic"
+	"time"
 	"unsafe"
 
 	"github.com/rinha2026/sketchy/api/internal/ivf"
@@ -31,9 +34,10 @@ const (
 
 // Config wires the server to its dependencies.
 type Config struct {
-	UDSPath    string
-	Index      *ivf.Index
-	SearchOpts ivf.SearchOpts
+	UDSPath      string
+	Index        *ivf.Index
+	SearchOpts   ivf.SearchOpts
+	ProfileEvery int
 }
 
 // Run binds to UDSPath and serves until the listener is closed. Returns the
@@ -51,6 +55,7 @@ func Run(cfg Config) (net.Listener, error) {
 		return nil, fmt.Errorf("chmod %s: %w", cfg.UDSPath, err)
 	}
 
+	prof := newProfiler(cfg.ProfileEvery)
 	go func() {
 		for {
 			conn, err := ln.Accept()
@@ -60,16 +65,56 @@ func Run(cfg Config) (net.Listener, error) {
 				}
 				continue
 			}
-			go handle(conn, cfg.Index, cfg.SearchOpts)
+			go handle(conn, cfg.Index, cfg.SearchOpts, prof)
 		}
 	}()
 	return ln, nil
 }
 
+type profiler struct {
+	every           uint64
+	requests        atomic.Uint64
+	vectorizeNs     atomic.Uint64
+	searchNs        atomic.Uint64
+	writeNs         atomic.Uint64
+	scannedClusters atomic.Uint64
+	scannedVectors  atomic.Uint64
+}
+
+func newProfiler(every int) *profiler {
+	if every <= 0 {
+		return nil
+	}
+	log.Printf("profile enabled: logging cumulative averages every %d requests", every)
+	return &profiler{every: uint64(every)}
+}
+
+func (p *profiler) record(vectorizeDur, searchDur, writeDur time.Duration, stats ivf.SearchStats) {
+	n := p.requests.Add(1)
+	p.vectorizeNs.Add(uint64(vectorizeDur))
+	p.searchNs.Add(uint64(searchDur))
+	p.writeNs.Add(uint64(writeDur))
+	p.scannedClusters.Add(uint64(stats.ScannedClusters))
+	p.scannedVectors.Add(uint64(stats.ScannedVectors))
+	if n%p.every != 0 {
+		return
+	}
+	requests := float64(n)
+	log.Printf(
+		"profile req=%d avg_vectorize=%s avg_search=%s avg_write=%s avg_clusters=%.1f avg_vectors=%.0f",
+		n,
+		time.Duration(p.vectorizeNs.Load()/n),
+		time.Duration(p.searchNs.Load()/n),
+		time.Duration(p.writeNs.Load()/n),
+		float64(p.scannedClusters.Load())/requests,
+		float64(p.scannedVectors.Load())/requests,
+	)
+}
+
 // handle serves all requests on a single keep-alive connection. The buffer is
 // allocated once per connection — across requests on the same connection,
 // data is shifted left after each request rather than reallocated.
-func handle(conn net.Conn, idx *ivf.Index, opts ivf.SearchOpts) {
+func handle(conn net.Conn, idx *ivf.Index, opts ivf.SearchOpts, prof *profiler) {
 	defer conn.Close()
 	buf := make([]byte, maxRequestSize)
 	var q [14]float32
@@ -82,6 +127,9 @@ func handle(conn net.Conn, idx *ivf.Index, opts ivf.SearchOpts) {
 		var closeAfter bool
 		var resp []byte
 		var ready bool
+		var recordProfile bool
+		var vectorizeDur, searchDur time.Duration
+		var stats ivf.SearchStats
 
 		for !ready {
 			if used >= len(buf) {
@@ -159,11 +207,35 @@ func handle(conn net.Conn, idx *ivf.Index, opts ivf.SearchOpts) {
 			msgEnd = bodyStart + contentLength
 
 			body := buf[bodyStart:msgEnd]
+			if prof == nil {
+				if err := vectorize.Build(body, &q); err != nil {
+					resp = responses.BadRequest
+					closeAfter = true
+				} else {
+					frauds := idx.Search(&q, opts)
+					if frauds < 0 || frauds > 5 {
+						resp = responses.ServerError
+						closeAfter = true
+					} else {
+						resp = responses.FraudScore[frauds]
+					}
+				}
+				ready = true
+				continue
+			}
+
+			startVectorize := time.Now()
+			recordProfile = true
 			if err := vectorize.Build(body, &q); err != nil {
+				vectorizeDur = time.Since(startVectorize)
 				resp = responses.BadRequest
 				closeAfter = true
 			} else {
-				frauds := idx.Search(&q, opts)
+				vectorizeDur = time.Since(startVectorize)
+				startSearch := time.Now()
+				frauds, searchStats := idx.SearchWithStats(&q, opts)
+				searchDur = time.Since(startSearch)
+				stats = searchStats
 				if frauds < 0 || frauds > 5 {
 					resp = responses.ServerError
 					closeAfter = true
@@ -174,8 +246,18 @@ func handle(conn net.Conn, idx *ivf.Index, opts ivf.SearchOpts) {
 			ready = true
 		}
 
-		if _, err := conn.Write(resp); err != nil {
-			return
+		if prof == nil {
+			if _, err := conn.Write(resp); err != nil {
+				return
+			}
+		} else {
+			startWrite := time.Now()
+			if _, err := conn.Write(resp); err != nil {
+				return
+			}
+			if recordProfile {
+				prof.record(vectorizeDur, searchDur, time.Since(startWrite), stats)
+			}
 		}
 		if closeAfter {
 			return
@@ -210,7 +292,7 @@ func parseContentLength(headers []byte) (int, bool) {
 		if len(line) < len(target) {
 			continue
 		}
-		if !bytes.EqualFold(line[:len(target)], []byte(target)) {
+		if !hasHeaderPrefix(line, target) {
 			continue
 		}
 		v := line[len(target):]
@@ -220,7 +302,9 @@ func parseContentLength(headers []byte) (int, bool) {
 		}
 		// Parse digits — zero-copy via unsafe.String. v is a re-slice of the
 		// per-connection request buffer, which Atoi only reads.
-		v = bytes.TrimRight(v, " \t")
+		for len(v) > 0 && (v[len(v)-1] == ' ' || v[len(v)-1] == '\t') {
+			v = v[:len(v)-1]
+		}
 		if len(v) == 0 {
 			return 0, false
 		}
@@ -231,4 +315,20 @@ func parseContentLength(headers []byte) (int, bool) {
 		return n, true
 	}
 	return 0, false
+}
+
+func hasHeaderPrefix(line []byte, target string) bool {
+	if len(line) < len(target) {
+		return false
+	}
+	for i := 0; i < len(target); i++ {
+		c := line[i]
+		if c >= 'A' && c <= 'Z' {
+			c += 'a' - 'A'
+		}
+		if c != target[i] {
+			return false
+		}
+	}
+	return true
 }
