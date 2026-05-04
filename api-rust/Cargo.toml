@@ -10,6 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 libc = "0.2"
+memchr = { version = "2", default-features = false, features = ["std"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

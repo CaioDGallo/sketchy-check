@@ -119,26 +119,7 @@ fn find_key(body: &[u8], start: usize, end: usize, key: &[u8]) -> Option<usize> 
     if start >= end {
         return None;
     }
-    memmem(&body[start..end], key).map(|p| start + p)
-}
-
-fn memmem(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    if needle.len() > haystack.len() {
-        return None;
-    }
-    let last = haystack.len() - needle.len();
-    let first = needle[0];
-    let mut i = 0;
-    while i <= last {
-        if haystack[i] == first && &haystack[i..i + needle.len()] == needle {
-            return Some(i);
-        }
-        i += 1;
-    }
-    None
+    memchr::memmem::find(&body[start..end], key).map(|p| start + p)
 }
 
 fn index_byte_from(body: &[u8], start: usize, end: usize, c: u8) -> Option<usize> {
