@@ -7,7 +7,7 @@
 #   total 1.00 CPU + 350 MB  (matches the contest cap exactly)
 
 x-api-common: &api-common
-  image: caiogallo2401/sketchy-rust:0.1.0
+  image: caiogallo2401/sketchy-rust:0.2.0
   volumes:
     - rinha-sockets:/sockets
   networks:
