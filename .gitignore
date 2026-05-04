@@ -1,0 +1,15 @@
+# Build artifacts copied at make-build time; the index.bin blob is ~99 MB.
+build_resources/
+
+# Local testing artifacts
+*.sock
+test/results.json
+
+# Local Go build outputs (the cmd/* dirs sometimes leave a binary behind)
+api/preprocess
+api/api
+
+# Editor / OS noise
+.DS_Store
+.idea/
+.vscode/
