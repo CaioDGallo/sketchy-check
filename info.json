@@ -1,0 +1,10 @@
+{
+  "participants": ["Caio Gallo"],
+  "social": [
+    "https://github.com/CaioDGallo",
+    "https://www.linkedin.com/in/caio-gallo/"
+  ],
+  "source-code-repo": "https://github.com/CaioDGallo/sketchy-check",
+  "stack": ["go", "c", "nginx", "avx2", "ivf", "k-means", "cgo"],
+  "open_to_work": false
+}
