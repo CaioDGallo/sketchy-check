@@ -56,6 +56,8 @@ pub fn run(cfg: &Config, idx: &Index, mcc_table: &mcc::Table) -> Result<(), Stri
     let mut cqe_buf: Vec<(u64, i32)> = Vec::with_capacity(cfg.iouring_qd as usize);
     let mut q = [0f32; 14];
 
+    eprintln!("server mode: io_uring (qd={}, accept_sqes={})", cfg.iouring_qd, cfg.accept_sqes);
+
     // Prime accept SQEs.
     for _ in 0..cfg.accept_sqes {
         push_accept(&mut ring, server_fd)?;
