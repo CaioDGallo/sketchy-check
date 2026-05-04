@@ -9,6 +9,10 @@
 
 x-api-common: &api-common
   image: caiogallo2401/sketchy-rust:0.4.0
+  # Required for io_uring_setup to bypass Docker's default seccomp profile,
+  # which on some runtimes blocks io_uring syscalls. Matches the C #1 setup.
+  security_opt:
+    - seccomp=unconfined
   volumes:
     - rinha-sockets:/sockets
   networks:
