@@ -2,7 +2,6 @@ package ivf
 
 import (
 	"math"
-	"sort"
 
 	"github.com/rinha2026/sketchy/api/internal/ivf/kernel"
 )
@@ -40,23 +39,22 @@ func (idx *Index) Search(qFloat *[D]float32, opts SearchOpts) int {
 		qGrid[j] = float32(qInt[j]) / FixScale
 	}
 
-	// Centroid distance for all 256, then partial-sort to keep the top NPROBE.
-	type cluster struct {
-		idx     int
-		penalty float32
-	}
-	probes := make([]cluster, K)
+	// Centroid distance for all 256, then select the closest NPROBE clusters
+	// without allocating or reflect-based sorting.
+	var centroidDist [K]float32
 	for c := 0; c < K; c++ {
-		probes[c] = cluster{c, centroidSqDist(qGrid[:], idx.Centroids[c*D:(c+1)*D])}
+		centroidDist[c] = centroidSqDist(qGrid[:], idx.Centroids[c*D:(c+1)*D])
 	}
-	sort.Slice(probes, func(i, j int) bool { return probes[i].penalty < probes[j].penalty })
 
 	var top kernel.Top5
 	top.Reset()
 
 	scanned := [K]bool{}
 	for p := 0; p < nprobe; p++ {
-		c := probes[p].idx
+		c := closestUnscannedCluster(&centroidDist, &scanned)
+		if c < 0 {
+			break
+		}
 		start, end := idx.ClusterStart[c], idx.ClusterEnd[c]
 		if end <= start {
 			scanned[c] = true
@@ -85,6 +83,21 @@ func (idx *Index) Search(qFloat *[D]float32, opts SearchOpts) int {
 	}
 
 	return top.Frauds()
+}
+
+func closestUnscannedCluster(centroidDist *[K]float32, scanned *[K]bool) int {
+	best := -1
+	bestDist := float32(math.MaxFloat32)
+	for c := 0; c < K; c++ {
+		if scanned[c] {
+			continue
+		}
+		if centroidDist[c] < bestDist {
+			best = c
+			bestDist = centroidDist[c]
+		}
+	}
+	return best
 }
 
 // centroidSqDist computes squared Euclidean distance between query and a

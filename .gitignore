@@ -13,3 +13,5 @@ api/api
 .DS_Store
 .idea/
 .vscode/
+
+api/.gocache
