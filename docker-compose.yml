@@ -7,7 +7,7 @@
 #   total 1.00  CPU + 350 MB  (matches the contest cap exactly)
 
 x-api-common: &api-common
-  image: caiogallo2401/sketchy-check:0.1.1
+  image: caiogallo2401/sketchy-check:0.1.2
   volumes:
     - rinha-sockets:/sockets
   networks:
@@ -51,7 +51,7 @@ services:
       IVF_NPROBE: "1"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
-      GOMAXPROCS: "2"
+      GOMAXPROCS: "1"
 
   api2:
     <<: *api-common
@@ -63,7 +63,7 @@ services:
       IVF_NPROBE: "1"
       GOGC: "off"
       GOMEMLIMIT: "140MiB"
-      GOMAXPROCS: "2"
+      GOMAXPROCS: "1"
 
 networks:
   rinha-net:
